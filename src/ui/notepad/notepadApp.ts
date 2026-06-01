@@ -33,7 +33,7 @@ export class NotepadApp {
   private readonly root: HTMLElement;
   private readonly store = new NoteStore();
   private readonly localRepo: NotepadRepository = new LocalStorageRepo();
-  private spacetimeRepo: NotepadRepository | null = null;
+  private spacetimeRepo: SpacetimeNotepadRepo | null = null;
   private repo: NotepadRepository = this.localRepo;
   private storageMode: 'local' | 'spacetime' = 'local';
   private readonly expanded = new Set<number>([0]);
@@ -60,6 +60,8 @@ export class NotepadApp {
   private helpMenuOpen = false;
   private liveSyncTimer: number | null = null;
   private uiStateSyncTimer: number | null = null;
+  private fileStatusTimer: number | null = null;
+  private fileActionStatus = '';
   private currentDocFingerprint = '';
   private readonly seenUiEventIds = new Set<string>();
   private uiStateFingerprint = '';
@@ -76,17 +78,13 @@ export class NotepadApp {
   constructor(root: HTMLElement) {
     this.root = root;
     this.storageMode = this.loadStorageModePreference();
-    if (this.storageMode === 'spacetime') {
-      // Spacetime connection is now explicit via the Connect action.
-      this.storageMode = 'local';
-      this.persistStorageModePreference('local');
-    }
     this.loadSpacetimeTargetsPreference();
     this.bootstrapInstructions();
     this.renderShell();
     this.renderTree();
     this.attachGlobalEvents();
     this.markClean();
+    void this.initializePreferredStorage();
   }
 
   private defaultSpacetimeTarget(): SpacetimeTarget {
@@ -101,11 +99,20 @@ export class NotepadApp {
   }
 
   private makeTargetId(endpoint: string, schema: string): string {
-    return `${endpoint.trim().toLowerCase()}|${schema.trim().toLowerCase()}`;
+    return `${this.normalizeEndpoint(endpoint).toLowerCase()}|${this.normalizeSchema(schema).toLowerCase()}`;
   }
 
   private normalizeEndpoint(endpoint: string): string {
     return endpoint.trim().replace(/\/+$/, '');
+  }
+
+  private normalizeSchema(schema: string): string {
+    const trimmed = schema.trim();
+    const lower = trimmed.toLowerCase();
+    if (lower === 'mmonotepad' || lower === 'mmo') {
+      return 'notepad';
+    }
+    return trimmed;
   }
 
   private loadSpacetimeTargetsPreference(): void {
@@ -121,7 +128,7 @@ export class NotepadApp {
               id: this.makeTargetId(String(target.endpoint ?? ''), String(target.schema ?? '')),
               name: String(target.name ?? '').trim() || 'Custom',
               endpoint: this.normalizeEndpoint(String(target.endpoint ?? '')),
-              schema: String(target.schema ?? '').trim(),
+              schema: this.normalizeSchema(String(target.schema ?? '')),
               isDefault: false,
             }))
             .filter((target) => target.endpoint.length > 0 && target.schema.length > 0);
@@ -138,7 +145,7 @@ export class NotepadApp {
         id: this.makeTargetId(legacyEndpoint, legacySchema),
         name: 'Legacy',
         endpoint: this.normalizeEndpoint(legacyEndpoint),
-        schema: legacySchema,
+        schema: this.normalizeSchema(legacySchema),
       });
     }
 
@@ -149,7 +156,9 @@ export class NotepadApp {
     }
 
     this.spacetimeTargets = Array.from(byId.values());
-    this.selectedSpacetimeTargetId = window.localStorage.getItem(SPACETIME_TARGET_SELECTED_KEY)?.trim() ?? fallback.id;
+    this.selectedSpacetimeTargetId = this.normalizeTargetId(
+      window.localStorage.getItem(SPACETIME_TARGET_SELECTED_KEY)?.trim() ?? fallback.id,
+    );
     if (!this.spacetimeTargets.some((target) => target.id === this.selectedSpacetimeTargetId)) {
       this.selectedSpacetimeTargetId = fallback.id;
     }
@@ -158,6 +167,14 @@ export class NotepadApp {
     this.draftSpacetimeEndpoint = fallback.endpoint;
     this.draftSpacetimeSchema = fallback.schema;
     this.persistSpacetimeTargetsPreference();
+  }
+
+  private normalizeTargetId(id: string): string {
+    const parts = id.split('|');
+    if (parts.length !== 2) {
+      return id;
+    }
+    return this.makeTargetId(parts[0], parts[1]);
   }
 
   private persistSpacetimeTargetsPreference(): void {
@@ -224,11 +241,39 @@ export class NotepadApp {
 
   private loadStorageModePreference(): 'local' | 'spacetime' {
     const raw = window.localStorage.getItem(STORAGE_MODE_KEY);
-    return raw === 'spacetime' ? 'spacetime' : 'local';
+    if (raw === 'local' || raw === 'spacetime') {
+      return raw;
+    }
+    return 'spacetime';
   }
 
   private persistStorageModePreference(mode: 'local' | 'spacetime'): void {
     window.localStorage.setItem(STORAGE_MODE_KEY, mode);
+  }
+
+  private isSpacetimeConnected(): boolean {
+    return this.spacetimeRepo instanceof SpacetimeNotepadRepo;
+  }
+
+  private connectedSpacetimeRepo(): SpacetimeNotepadRepo | null {
+    return this.spacetimeRepo instanceof SpacetimeNotepadRepo ? this.spacetimeRepo : null;
+  }
+
+  private confirmDelete(message: string): boolean {
+    return window.confirm(message);
+  }
+
+  private showFileStatus(message: string): void {
+    this.fileActionStatus = message;
+    if (this.fileStatusTimer !== null) {
+      window.clearTimeout(this.fileStatusTimer);
+    }
+    this.fileStatusTimer = window.setTimeout(() => {
+      this.fileActionStatus = '';
+      this.fileStatusTimer = null;
+      this.renderShell();
+    }, 2500);
+    this.renderShell();
   }
 
   private bootstrapInstructions(): void {
@@ -243,10 +288,13 @@ export class NotepadApp {
   }
 
   private renderShell(): void {
-    const saveLabel = this.storageMode === 'spacetime' ? 'Save to SpacetimeDB' : 'Save in browser';
-    const loadLabel = this.storageMode === 'spacetime' ? 'Load from SpacetimeDB' : 'Load from browser';
-    const deleteLabel = this.storageMode === 'spacetime' ? 'Delete from SpacetimeDB' : 'Delete saved file';
     const modeLabel = this.storageMode === 'spacetime' ? 'SpacetimeDB' : 'Local';
+    const spacetimeConnected = this.isSpacetimeConnected();
+    const spacetimeDisabledAttr = spacetimeConnected ? '' : ' disabled aria-disabled="true"';
+    const spacetimeActionTitle = spacetimeConnected ? 'Use the connected SpacetimeDB database' : 'Connect to SpacetimeDB first';
+    const fileStatusBadge = this.fileActionStatus
+      ? `<div class="tnp-file-status">${this.escapeHtmlText(this.fileActionStatus)}</div>`
+      : '';
 
     const identityBadge =
       this.storageMode === 'spacetime' && this.identityLabel
@@ -276,13 +324,14 @@ export class NotepadApp {
             <button class="tnp-dropdown-button" data-action="toggle-file">File</button>
             <div class="tnp-dropdown-content ${this.fileMenuOpen ? '' : 'hidden'}" data-role="file-menu">
               <button data-action="new-document">New Document</button>
-              <button data-action="download">Download to Computer</button>
-              <button data-action="upload">Upload from Computer</button>
-              <input data-role="upload-input" type="file" accept=".tnp" hidden />
-              <button data-action="save">${saveLabel}</button>
               <button data-action="rename">Rename</button>
-              <button data-action="load">${loadLabel}</button>
-              <button data-action="delete">${deleteLabel}</button>
+              <button data-action="download">Save to desktop</button>
+              <button data-action="upload">Load from desktop</button>
+              <input data-role="upload-input" type="file" accept=".tnp" hidden />
+              <button data-action="save-browser">Save to browser</button>
+              <button data-action="load-browser">Load from browser</button>
+              <button data-action="save-spacetime" title="${spacetimeActionTitle}"${spacetimeDisabledAttr}>Save to SpacetimeDB</button>
+              <button data-action="load-spacetime" title="${spacetimeActionTitle}"${spacetimeDisabledAttr}>Load from SpacetimeDB</button>
             </div>
           </div>
           <div class="tnp-dropdown">
@@ -333,13 +382,14 @@ export class NotepadApp {
               </label>
               <label class="tnp-storage-mode-row">
                 New schema
-                <input data-role="new-spacetime-schema" type="text" value="${this.escapeHtmlAttr(this.draftSpacetimeSchema)}" placeholder="mmonotepad" />
+                <input data-role="new-spacetime-schema" type="text" value="${this.escapeHtmlAttr(this.draftSpacetimeSchema)}" placeholder="notepad" />
               </label>
               <button data-action="test-save-spacetime-target" class="tnp-connect-btn">Test &amp; Save</button>
               <div class="tnp-connect-status" data-connect-state="${this.spacetimeConnectStatus}">${this.spacetimeConnectMessage || 'Not connected'}</div>
             </div>
           </div>
           <div class="tnp-header-right">
+            ${fileStatusBadge}
             <div class="tnp-mode-badge">Mode: ${modeLabel}</div>
             ${identityBadge}
             <button class="tnp-help-fab" data-action="toggle-help" title="Help">${this.helpMenuOpen ? 'X' : '?'}</button>
@@ -425,12 +475,25 @@ export class NotepadApp {
       }
       input.value = '';
     });
-    this.root.querySelector<HTMLButtonElement>('[data-action="save"]')?.addEventListener('click', () => {
-      void this.persistCurrentDocument(this.currentName);
+    this.root.querySelector<HTMLButtonElement>('[data-action="save-browser"]')?.addEventListener('click', () => {
+      void this.persistCurrentDocumentToRepo(this.localRepo, this.currentName, 'Saved to browser');
     });
     this.root.querySelector<HTMLButtonElement>('[data-action="rename"]')?.addEventListener('click', () => this.promptAndRename());
-    this.root.querySelector<HTMLButtonElement>('[data-action="load"]')?.addEventListener('click', () => this.loadPrompt());
-    this.root.querySelector<HTMLButtonElement>('[data-action="delete"]')?.addEventListener('click', () => this.deletePrompt());
+    this.root.querySelector<HTMLButtonElement>('[data-action="load-browser"]')?.addEventListener('click', () =>
+      this.loadPrompt(this.localRepo, 'browser'),
+    );
+    this.root.querySelector<HTMLButtonElement>('[data-action="save-spacetime"]')?.addEventListener('click', () => {
+      const repo = this.connectedSpacetimeRepo();
+      if (repo) {
+        void this.persistCurrentDocumentToRepo(repo, this.currentName, 'Saved to SpacetimeDB');
+      }
+    });
+    this.root.querySelector<HTMLButtonElement>('[data-action="load-spacetime"]')?.addEventListener('click', () => {
+      const repo = this.connectedSpacetimeRepo();
+      if (repo) {
+        this.loadPrompt(repo, 'spacetime');
+      }
+    });
 
     this.root.querySelector<HTMLInputElement>('[data-role="truncate"]')?.addEventListener('change', (e) => {
       this.truncateNotes = (e.currentTarget as HTMLInputElement).checked;
@@ -641,7 +704,14 @@ export class NotepadApp {
       );
     });
     this.root.querySelector<HTMLButtonElement>('[data-action="remote-delete"]')?.addEventListener('click', () => {
-      withRepo(async (repo) => repo.deleteNote(this.currentName, numberFrom('remote-note-id', this.focusedId)));
+      const noteId = numberFrom('remote-note-id', this.focusedId);
+      if (!this.confirmDelete(`Delete note ${noteId} from ${this.currentName}?`)) {
+        return;
+      }
+      withRepo(async (repo) => {
+        await repo.deleteNote(this.currentName, noteId);
+        this.showFileStatus(`Deleted note ${noteId}`);
+      });
     });
     this.root.querySelector<HTMLButtonElement>('[data-action="remote-move"]')?.addEventListener('click', () => {
       withRepo(async (repo) =>
@@ -1003,6 +1073,17 @@ export class NotepadApp {
         this.renderTree();
       }
     });
+    window.addEventListener('beforeunload', () => {
+      this.persistStorageModePreference(this.storageMode);
+      this.persistSpacetimeTargetsPreference();
+    });
+  }
+
+  private async initializePreferredStorage(): Promise<void> {
+    if (this.storageMode !== 'spacetime') {
+      return;
+    }
+    await this.connectSpacetime({ switchModeOnSuccess: true });
   }
 
   private buildHelpRowsHtml(): string {
@@ -1354,6 +1435,12 @@ export class NotepadApp {
         if (parent === null || parent === undefined) {
           return;
         }
+        const deleteMessage = focusedItem?.isReference
+          ? `Remove reference to note ${this.focusedId}?`
+          : `Delete note ${this.focusedId} and its children?`;
+        if (!this.confirmDelete(deleteMessage)) {
+          return;
+        }
         if (focusedItem?.isReference) {
           this.removeReference(parent, this.focusedId);
         } else {
@@ -1516,16 +1603,16 @@ export class NotepadApp {
     }
   }
 
-  private loadPrompt(): void {
-    const keys = this.repo.listKeys();
+  private loadPrompt(repo: NotepadRepository = this.repo, source: 'browser' | 'spacetime' = this.storageMode === 'spacetime' ? 'spacetime' : 'browser'): void {
+    const keys = repo.listKeys();
     if (keys.length === 0) {
-      window.alert('No saved files in browser storage.');
+      window.alert(source === 'spacetime' ? 'No saved documents in SpacetimeDB.' : 'No saved files in browser storage.');
       return;
     }
-    this.openLoadDialog(keys);
+    this.openLoadDialog(keys, repo, source);
   }
 
-  private openLoadDialog(keys: string[]): void {
+  private openLoadDialog(keys: string[], repo: NotepadRepository = this.repo, source: 'browser' | 'spacetime' = 'browser'): void {
     const overlay = document.createElement('div');
     overlay.className = 'tnp-modal-overlay';
     const panel = document.createElement('div');
@@ -1563,7 +1650,7 @@ export class NotepadApp {
         row.classList.add('selected');
       });
       label.addEventListener('dblclick', () => {
-        this.loadDocumentByKey(key);
+        this.loadDocumentByKey(key, repo, source);
         close();
       });
 
@@ -1574,7 +1661,12 @@ export class NotepadApp {
       deleteBtn.title = `Delete ${key}`;
       deleteBtn.addEventListener('click', async (event) => {
         event.stopPropagation();
-        await this.repo.delete(key);
+        const sourceLabel = source === 'spacetime' ? 'SpacetimeDB' : 'browser storage';
+        if (!this.confirmDelete(`Delete "${key}" from ${sourceLabel}?`)) {
+          return;
+        }
+        await repo.delete(key);
+        this.showFileStatus(`Deleted "${key}" from ${source === 'spacetime' ? 'SpacetimeDB' : 'browser'}`);
         row.remove();
         const remaining = Array.from(list.querySelectorAll('.tnp-modal-row-label')).map((el) => (el as HTMLButtonElement).textContent ?? '');
         if (remaining.length === 0) {
@@ -1605,14 +1697,14 @@ export class NotepadApp {
       if (event.key === 'Escape') {
         close();
       } else if (event.key === 'Enter') {
-        this.loadDocumentByKey(selected);
+        this.loadDocumentByKey(selected, repo, source);
         close();
       }
     };
 
     panel.querySelector<HTMLButtonElement>('[data-action="modal-cancel"]')?.addEventListener('click', close);
     panel.querySelector<HTMLButtonElement>('[data-action="modal-load"]')?.addEventListener('click', () => {
-      this.loadDocumentByKey(selected);
+      this.loadDocumentByKey(selected, repo, source);
       close();
     });
     overlay.addEventListener('click', (event) => {
@@ -1623,16 +1715,19 @@ export class NotepadApp {
     document.addEventListener('keydown', onKey);
   }
 
-  private loadDocumentByKey(picked: string): void {
-    const data = this.repo.load(picked);
+  private loadDocumentByKey(picked: string, repo: NotepadRepository = this.repo, source: 'browser' | 'spacetime' = this.storageMode === 'spacetime' ? 'spacetime' : 'browser'): void {
+    const data = repo.load(picked);
     if (!data) {
       window.alert('File not found.');
       return;
     }
     this.store.reset();
     this.store.loadFromJSON(data);
-    if (this.storageMode !== 'spacetime') {
-      this.currentName = picked;
+    this.currentName = picked;
+    if (source === 'spacetime' && repo instanceof SpacetimeNotepadRepo) {
+      this.storageMode = 'spacetime';
+      this.repo = repo;
+      this.persistStorageModePreference('spacetime');
     }
     this.focusedId = 0;
     this.selectedIds = new Set<number>();
@@ -1643,121 +1738,16 @@ export class NotepadApp {
     this.markClean();
     this.currentDocFingerprint = JSON.stringify(data.notes);
     this.uiStateFingerprint = this.buildUiStateFingerprint();
+    this.showFileStatus(`Loaded from ${source === 'spacetime' ? 'SpacetimeDB' : 'browser'}`);
+    this.renderShell();
     this.renderTree();
 
-    if (this.storageMode === 'spacetime' && this.spacetimeRepo instanceof SpacetimeNotepadRepo) {
-      void this.spacetimeRepo.setSessionDocument(picked).catch((error) => {
+    if (source === 'spacetime' && repo instanceof SpacetimeNotepadRepo) {
+      void repo.setSessionDocument(picked).catch((error) => {
         const message = error instanceof Error ? error.message : 'Failed to update active session document';
         window.alert(message);
       });
     }
-  }
-
-  private deletePrompt(): void {
-    const keys = this.repo.listKeys();
-    if (keys.length === 0) {
-      window.alert('No saved files in browser storage.');
-      return;
-    }
-    this.openDeleteDialog(keys);
-  }
-
-  private openDeleteDialog(keys: string[]): void {
-    const overlay = document.createElement('div');
-    overlay.className = 'tnp-modal-overlay';
-    const panel = document.createElement('div');
-    panel.className = 'tnp-modal-panel';
-    panel.innerHTML = `
-      <div class="tnp-modal-title">Delete Document</div>
-      <div class="tnp-modal-subtitle">Single-click to select, double-click to delete.</div>
-      <div class="tnp-modal-list" data-role="modal-list"></div>
-      <div class="tnp-modal-actions">
-        <button data-action="modal-cancel">Cancel</button>
-        <button data-action="modal-delete">Delete</button>
-      </div>
-    `;
-    overlay.appendChild(panel);
-    document.body.appendChild(overlay);
-
-    const list = panel.querySelector<HTMLElement>('[data-role="modal-list"]') as HTMLElement;
-    let selected = keys[0];
-    const makeRow = (key: string) => {
-      const row = document.createElement('div');
-      row.className = 'tnp-modal-row';
-      if (key === selected) {
-        row.classList.add('selected');
-      }
-
-      const label = document.createElement('button');
-      label.type = 'button';
-      label.className = 'tnp-modal-row-label';
-      label.textContent = key;
-      label.addEventListener('click', () => {
-        selected = key;
-        for (const element of list.querySelectorAll('.tnp-modal-row')) {
-          element.classList.remove('selected');
-        }
-        row.classList.add('selected');
-      });
-      label.addEventListener('dblclick', async () => {
-        await this.repo.delete(key);
-        close();
-      });
-
-      const deleteBtn = document.createElement('button');
-      deleteBtn.type = 'button';
-      deleteBtn.className = 'tnp-modal-row-delete';
-      deleteBtn.textContent = 'X';
-      deleteBtn.title = `Delete ${key}`;
-      deleteBtn.addEventListener('click', async (event) => {
-        event.stopPropagation();
-        await this.repo.delete(key);
-        row.remove();
-        const remaining = Array.from(list.querySelectorAll('.tnp-modal-row-label')).map((el) => (el as HTMLButtonElement).textContent ?? '');
-        if (remaining.length === 0) {
-          close();
-          return;
-        }
-        if (selected === key) {
-          selected = remaining[0];
-          const firstRow = list.querySelector('.tnp-modal-row');
-          firstRow?.classList.add('selected');
-        }
-      });
-
-      row.appendChild(label);
-      row.appendChild(deleteBtn);
-      return row;
-    };
-
-    for (const key of keys) {
-      list.appendChild(makeRow(key));
-    }
-
-    const close = () => {
-      overlay.remove();
-      document.removeEventListener('keydown', onKey);
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        close();
-      } else if (event.key === 'Enter') {
-        void this.repo.delete(selected);
-        close();
-      }
-    };
-
-    panel.querySelector<HTMLButtonElement>('[data-action="modal-cancel"]')?.addEventListener('click', close);
-    panel.querySelector<HTMLButtonElement>('[data-action="modal-delete"]')?.addEventListener('click', () => {
-      void this.repo.delete(selected);
-      close();
-    });
-    overlay.addEventListener('click', (event) => {
-      if (event.target === overlay) {
-        close();
-      }
-    });
-    document.addEventListener('keydown', onKey);
   }
 
   private download(): void {
@@ -1768,6 +1758,7 @@ export class NotepadApp {
     anchor.click();
     URL.revokeObjectURL(anchor.href);
     this.markClean();
+    this.showFileStatus('Saved to desktop');
     this.renderTree();
   }
 
@@ -1780,6 +1771,7 @@ export class NotepadApp {
     const fileName = file.name.replace(/\.tnp$/i, '');
     this.store.merge(parsed, fileName);
     this.markDirty();
+    this.showFileStatus('Loaded from desktop');
     this.renderTree();
   }
 
@@ -1796,10 +1788,18 @@ export class NotepadApp {
   }
 
   private async persistCurrentDocument(docName: string): Promise<void> {
+    await this.persistCurrentDocumentToRepo(this.repo, docName);
+  }
+
+  private async persistCurrentDocumentToRepo(repo: NotepadRepository, docName: string, successMessage = ''): Promise<void> {
     try {
-      await this.repo.save(docName, this.store.toSerializable());
+      const data = this.store.toSerializable();
+      await repo.save(docName, data);
       this.markClean();
-      this.currentDocFingerprint = JSON.stringify(this.store.toSerializable().notes);
+      this.currentDocFingerprint = JSON.stringify(data.notes);
+      if (successMessage) {
+        this.showFileStatus(successMessage);
+      }
       this.renderTree();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save document';
