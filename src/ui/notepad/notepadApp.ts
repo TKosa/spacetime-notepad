@@ -20,6 +20,7 @@ const SPACETIME_TARGET_SELECTED_KEY = 'tnp-spacetime-target-selected';
 const LIVE_SYNC_MS = 1000;
 const UI_STATE_SYNC_MS = 1500;
 const LAST_SPACETIME_DOC_KEY = 'tnp-last-spacetime-doc';
+const SHOW_NOTE_ID_KEY = 'tnp-show-note-id';
 
 type SpacetimeTarget = {
   id: string;
@@ -50,6 +51,7 @@ export class NotepadApp {
   private dirty = false;
   private currentName = 'Untitled';
   private truncateNotes = true;
+  private showNoteId = window.localStorage.getItem(SHOW_NOTE_ID_KEY) === 'true';
   private disableAutoSave = false;
 
   private listEl!: HTMLElement;
@@ -342,6 +344,10 @@ export class NotepadApp {
                 Truncate notes
               </label>
               <label>
+                <input data-role="show-id" type="checkbox" ${this.showNoteId ? 'checked' : ''} />
+                Show ID
+              </label>
+              <label>
                 <input data-role="autosave" type="checkbox" />
                 Disable Auto-save
               </label>
@@ -498,6 +504,11 @@ export class NotepadApp {
     this.root.querySelector<HTMLInputElement>('[data-role="truncate"]')?.addEventListener('change', (e) => {
       this.truncateNotes = (e.currentTarget as HTMLInputElement).checked;
       this.renderTree();
+    });
+    this.root.querySelector<HTMLInputElement>('[data-role="show-id"]')?.addEventListener('change', (e) => {
+      this.showNoteId = (e.currentTarget as HTMLInputElement).checked;
+      this.renderTree();
+      window.localStorage.setItem(SHOW_NOTE_ID_KEY, String(this.showNoteId));
     });
     this.root.querySelector<HTMLInputElement>('[data-role="autosave"]')?.addEventListener('change', (e) => {
       this.disableAutoSave = (e.currentTarget as HTMLInputElement).checked;
@@ -1230,6 +1241,13 @@ export class NotepadApp {
 
       const content = document.createElement('div');
       content.className = 'tnp-content';
+      if (this.showNoteId) {
+        content.classList.add('with-note-id');
+        const prefix = document.createElement('span');
+        prefix.className = 'tnp-note-id-prefix';
+        prefix.textContent = `${note.id}:`;
+        content.appendChild(prefix);
+      }
       if (this.editingId === note.id && note.id !== 0) {
         const textarea = document.createElement('textarea');
         textarea.value = note.markup;
